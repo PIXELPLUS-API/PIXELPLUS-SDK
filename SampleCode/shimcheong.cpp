@@ -8,7 +8,7 @@
 #include <CFrameGrabber/CFrameGrabber.h>
 #include <CImageProcessMng.h>
 #include <CIpmEnv.h>
-#include <plugins/CIpmUserCustom/CIpmUserCustom.h>
+#include <CIpmUserCustom/CIpmUserCustom.h>
 
 #include "GLFWImageWindow.h"
 
@@ -95,7 +95,7 @@ void ensureAllocatedOrResize(csh_img::CSH_Image& dst, const csh_img::CSH_Image& 
 // Example_Grabber
 // ============================================================================
 void Example_Grabber() {
-    grab.SetBackend(CFrameGrabber::En_GrabberBackend::UVC);
+    grab.SetBackend(CFrameGrabber::En_GrabberBackend::V4L2);
     int count = 0; std::vector<std::string> names;
     if (!grab.GetConnected(count, names)) {
         std::cerr << "GetConnected failed\n"; return;

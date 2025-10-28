@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <iostream>
 #include <vector>
+#include <cstring>
 
 // ============================ Shaders ========================================
 static const char* kVS = R"(
@@ -54,9 +55,10 @@ bool GLFWImageWindow::initialize(const char* title, int width, int height) {
         return false;
     }
 
+    // Request an OpenGL ES 3.1 context (Wayland/EGL on Pi OS)
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
 
     win_ = glfwCreateWindow(width, height, title, nullptr, nullptr);
     if (!win_) {
@@ -67,15 +69,14 @@ bool GLFWImageWindow::initialize(const char* title, int width, int height) {
     glfwMakeContextCurrent(win_);
     glfwSwapInterval(1); // vsync
 
-    // If you keep GLEW, this is usually okay on Mesa; if it misbehaves on ES,
-    // switch to glad/es or epoxy.
-    glewExperimental = GL_TRUE;
-    GLenum err = glewInit();
-    if (err != GLEW_OK) {
-        std::fprintf(stderr, "[GLEW] error: %s\n", (const char*)glewGetErrorString(err));
+    // Load GLES functions through GLFW's proc loader
+    if (!gladLoadGLES2Loader((GLADloadproc)glfwGetProcAddress)) {
+        std::fprintf(stderr, "[GLAD] load failed\n");
         return false;
     }
-    glGetError(); // clear benign error from glewInit
+
+    std::fprintf(stderr, "GL_VERSION  : %s\n", glGetString(GL_VERSION));
+    std::fprintf(stderr, "GL_RENDERER : %s\n", glGetString(GL_RENDERER));
 
     int w, h; glfwGetFramebufferSize(win_, &w, &h);
     fbW_ = std::max(1, w);
@@ -181,9 +182,9 @@ bool GLFWImageWindow::initGLObjects_() {
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 16, nullptr, GL_DYNAMIC_DRAW);
 
     glEnableVertexAttribArray(0); // aPos
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (void*)0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (void*)(uintptr_t)0);
     glEnableVertexAttribArray(1); // aUV
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (void*)(sizeof(float) * 2));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (void*)(uintptr_t)(sizeof(float) * 2));
 
     glBindVertexArray(0);
 
@@ -238,6 +239,8 @@ GLuint GLFWImageWindow::makeProgram_(const char* vs, const char* fs) {
 }
 
 // ======================== Private: texture upload ============================
+// NOTE: We implement a robust Gray16→Gray8 fallback so the viewer works even if
+// GL_R16 normalized textures are not available in your GLES stack.
 void GLFWImageWindow::uploadTextureFromView_() {
     const auto d = view_.uploadDesc();
     if (!d.data || d.width <= 0 || d.height <= 0) {
@@ -246,7 +249,7 @@ void GLFWImageWindow::uploadTextureFromView_() {
 
     const auto fmt = cameraImage_.getFormat();
 
-    // Decide GL storage/packing
+    // Decide GL storage/packing (defaults)
     GLenum internalFormat = GL_RGB8;
     GLenum format         = GL_RGB;
     GLenum type           = GL_UNSIGNED_BYTE;
@@ -254,25 +257,43 @@ void GLFWImageWindow::uploadTextureFromView_() {
     bool swizzleGray = false;
     bool swizzleBGR  = false;
 
+    // Optional temporary buffer for downconversion (e.g., Gray16 -> Gray8)
+    std::vector<uint8_t> tmp8;  // keeps lifetime until glTexSubImage2D
+
     switch (fmt) {
     case csh_img::En_ImageFormat::Gray8:
         internalFormat = GL_R8;  format = GL_RED; type = GL_UNSIGNED_BYTE; swizzleGray = true; break;
+
     case csh_img::En_ImageFormat::Gray16:
     case csh_img::En_ImageFormat::Gray10:
     case csh_img::En_ImageFormat::Gray12:
     case csh_img::En_ImageFormat::Gray14:
-        // GLES 3.x has GL_R16. If some driver complains, downconvert to 8-bit on CPU.
-        internalFormat = GL_R16; format = GL_RED; type = GL_UNSIGNED_SHORT; swizzleGray = true; break;
+        // Safe cross-driver path: downconvert to 8-bit on CPU.
+        // (Avoids relying on GL_R16 normalized support on GLES stacks.)
+        tmp8.resize(static_cast<size_t>(d.width) * static_cast<size_t>(d.height));
+        {
+            const uint16_t* src16 = reinterpret_cast<const uint16_t*>(d.data);
+            const size_t N = tmp8.size();
+            // Simple >>8 keeps MSBs; for 10/12/14-bit sources this is adequate for display.
+            for (size_t i = 0; i < N; ++i) tmp8[i] = static_cast<uint8_t>(src16[i] >> 8);
+        }
+        internalFormat = GL_R8;  format = GL_RED; type = GL_UNSIGNED_BYTE; swizzleGray = true;
+        break;
+
     case csh_img::En_ImageFormat::RGB888:
         internalFormat = GL_RGB8; format = GL_RGB; type = GL_UNSIGNED_BYTE; break;
+
     case csh_img::En_ImageFormat::BGR888:
         // Upload as RGB and swizzle R/B in the sampler state
         internalFormat = GL_RGB8; format = GL_RGB; type = GL_UNSIGNED_BYTE; swizzleBGR = true; break;
+
     case csh_img::En_ImageFormat::RGB565:
         internalFormat = GL_RGB;  format = GL_RGB; type = GL_UNSIGNED_SHORT_5_6_5; break;
+
     case csh_img::En_ImageFormat::YUV422:
         // Not handled here—convert before upload or use a YUV shader path.
         return;
+
     default:
         return;
     }
@@ -281,7 +302,6 @@ void GLFWImageWindow::uploadTextureFromView_() {
     glBindTexture(GL_TEXTURE_2D, tex_);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // Allocate only when needed (first time or size/format/type changed)
     const bool needAlloc =
         !texAllocated_ ||
         texW_ != d.width || texH_ != d.height ||
@@ -297,29 +317,43 @@ void GLFWImageWindow::uploadTextureFromView_() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-        // Set swizzle once per allocation/change
+        // Texture swizzle is core in GLES 3.x
         if (swizzleGray) {
-            GLint swz[4] = { GL_RED, GL_RED, GL_RED, GL_ONE };
-            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swz);
+            // Gray -> RGB, A=1
+            GLint sr = GL_RED, sg = GL_RED, sb = GL_RED, sa = GL_ONE;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, sr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, sg);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, sb);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, sa);
         } else if (swizzleBGR) {
-            GLint swz[4] = { GL_BLUE, GL_GREEN, GL_RED, GL_ONE };
-            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swz);
+            // BGR -> RGB
+            GLint sr = GL_BLUE, sg = GL_GREEN, sb = GL_RED, sa = GL_ONE;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, sr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, sg);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, sb);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, sa);
         } else {
-            GLint swz[4] = { GL_RED, GL_GREEN, GL_BLUE, GL_ONE };
-            glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swz);
+            // Identity RGB, A=1
+            GLint sr = GL_RED, sg = GL_GREEN, sb = GL_BLUE, sa = GL_ONE;
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, sr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, sg);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, sb);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, sa);
         }
 
-        texAllocated_ = true;
+        texAllocated_  = true;
         texW_ = d.width;  texH_ = d.height;
         texInternal_ = internalFormat; texFormat_ = format; texType_ = type;
     }
 
+    // Choose source pointer (original or downconverted)
+    const void* pixels = tmp8.empty() ? d.data : (const void*)tmp8.data();
+
     // Fast path: just update the pixels
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d.width, d.height, format, type, d.data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d.width, d.height, format, type, pixels);
 
     glBindTexture(GL_TEXTURE_2D, 0);
 }
-
 
 // ======================== Private: GLFW callbacks ============================
 void GLFWImageWindow::framebufferSizeCB_(GLFWwindow* w, int width, int height) {
